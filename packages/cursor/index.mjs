@@ -11,6 +11,12 @@
 //   CURSOR_API_KEY.
 //
 // Requests go to AgentService/Run, a Connect stream both ways over HTTP/2.
+// Cursor's "HTTP Compatibility Mode: HTTP/1.1" is the same Run split in
+// two, both HTTP/1.1: AgentService/RunSSE is the server's stream, and each
+// message the client sends (the Run, a heartbeat, a blob, a tool result)
+// is one unary BidiService/BidiAppend. That is what a proxy which breaks
+// HTTP/2 can carry. It is on when the plugin is given { http: "1.1" },
+// when provider.cursor.options.http is "1.1", or when CURSOR_HTTP is 1.1.
 // Cursor keeps a conversation on its client: each message of the prompt is
 // an AI SDK message in JSON, a blob named by its sha256, which the server
 // asks the client for as it reads them. So each request goes whole, as such
@@ -44,6 +50,13 @@ const MODELS_KEEP = 10 * 60 * 1000
 const CALL = "CallDynamicTool" // how the model calls an MCP tool
 const NO_RESULT = "Tool use was interrupted and did not produce a result."
 const CLI_MARK = "cursor-agent" // an oauth sign-in's refresh when the token is cursor-agent's own
+
+// useHTTP11 is Cursor's compatibility mode: the value its Network setting
+// stores when HTTP/2 is lowered to HTTP/1.1.
+function useHTTP11(v) {
+  v = String(v ?? "").trim().toLowerCase()
+  return v === "1.1" || v === "http/1.1" || v === "http1.1"
+}
 
 const GOOS = { win32: "windows" }[platform()] ?? platform()
 const EMPTY = Buffer.alloc(0)
@@ -1467,9 +1480,16 @@ async function agentURL(tok, fresh) {
   return url
 }
 
-// open starts a Run at base: the session, the stream, and the response's
-// status, or an error the request never got past.
-function open(base, headers, signal) {
+// open starts a Run at base. HTTP/2 resolves once the response headers are
+// in, with send writing frames on that stream. HTTP/1.1 resolves at once:
+// send is BidiAppend, and ready is the RunSSE response, which the caller
+// waits for after the first append is in flight. Either way, an error the
+// request never got past is error.
+function open(base, headers, signal, http11) {
+  return http11 ? openHTTP11(base, headers, signal) : openHTTP2(base, headers, signal)
+}
+
+function openHTTP2(base, headers, signal) {
   return new Promise((resolve) => {
     const u = new URL(base)
     const session = http2.connect(u.origin)
@@ -1487,18 +1507,112 @@ function open(base, headers, signal) {
       ...headers,
     })
     req.on("error", fail)
+    const send = (msg) => {
+      if (!req.destroyed && req.writable) req.write(frame(msg))
+    }
+    const close = () => {
+      try {
+        req.close(http2.constants.NGHTTP2_CANCEL)
+      } catch {}
+      session.close()
+      setTimeout(() => session.destroy(), 1000).unref?.()
+    }
     req.once("response", (h) => {
       if (done) return
       done = true
-      resolve({ session, req, status: Number(h[":status"]) })
+      resolve({ status: Number(h[":status"]), body: req, send, close, ready: Promise.resolve() })
     })
     signal?.addEventListener("abort", () => fail(new Error("the request was cancelled")), { once: true })
   })
 }
 
+// cursorHeaders is the Run's headers with one content type. accept-encoding
+// stays identity: Connect's own gzip flag is inside a frame, and a
+// content-encoding would take those bytes apart before they are read.
+function cursorHeaders(headers, contentType) {
+  return { ...headers, "content-type": contentType, "accept-encoding": "identity" }
+}
+
+// post11 is one HTTP/1.1 POST. Bun's fetch speaks HTTP/1.1 here, and the
+// host's fetch is what sends it through magpie's proxy; ALPN is pinned so a
+// later runtime does not negotiate h2 on the way.
+function post11(url, headers, body, signal) {
+  return fetch(url, {
+    method: "POST",
+    headers,
+    body,
+    signal,
+    tls: { ALPNProtocols: "http/1.1" },
+  })
+}
+
+// openHTTP11 is Cursor's HTTP/1.1 mode. RunSSE is a server stream whose
+// only input is the request id. Everything the client would have written
+// on the HTTP/2 stream is a BidiAppend of that id, numbered from 0: the
+// raw protobuf, not a Connect frame. The two start together, because the
+// server reads the appends to know what to stream.
+function openHTTP11(base, headers, signal) {
+  const requestId = randomUUID()
+  const u = new URL(base)
+  const root = u.origin + u.pathname.replace(/\/+$/, "")
+  const ac = new AbortController()
+  const onAbort = () => ac.abort()
+  if (signal?.aborted) ac.abort()
+  else signal?.addEventListener("abort", onAbort, { once: true })
+  let seq = 0
+  let closed = false
+  const out = {
+    status: 0,
+    body: null,
+    failed: null,
+    send(msg) {
+      if (closed || ac.signal.aborted) return
+      const n = seq++
+      // BidiAppendRequest: request_id (2), append_seqno (3), data_binary (4)
+      const body = pb().bytes(2, pb().str(1, requestId)).varint(3, n).bytes(4, msg).done()
+      post11(root + "/aiserver.v1.BidiService/BidiAppend", cursorHeaders(headers, "application/proto"), body, ac.signal)
+        .then(async (res) => {
+          if (res.ok || closed) {
+            await res.body?.cancel?.()
+            return
+          }
+          out.failed = failure(res.status, await res.text())
+          ac.abort()
+        })
+        .catch((e) => {
+          if (closed || ac.signal.aborted) return
+          out.failed = { status: 502, message: e?.message ?? String(e) }
+          ac.abort()
+        })
+    },
+    close() {
+      if (closed) return
+      closed = true
+      signal?.removeEventListener("abort", onAbort)
+      ac.abort()
+    },
+    ready: null,
+  }
+  out.ready = post11(
+    root + "/agent.v1.AgentService/RunSSE",
+    cursorHeaders(headers, "application/connect+proto"),
+    frame(pb().str(1, requestId).done()),
+    ac.signal,
+  )
+    .then((res) => {
+      out.status = res.status
+      out.body = res.body
+    })
+    .catch((e) => {
+      if (out.failed || closed) throw out.failed ? Object.assign(new Error(out.failed.message), { status: out.failed.status }) : e
+      throw e
+    })
+  return out
+}
+
 // runOnce is one Run of the chat on the agent API at base: an async
 // iterator of the answer's pieces, or the error it failed with before any.
-async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, params }) {
+async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, params, http11 }) {
   // the Run's conversation_id, a new one when nothing names the session:
   // its usage event is found by it
   const cid = convID || randomUUID()
@@ -1522,36 +1636,48 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
       "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
     },
     signal,
+    http11,
   )
   if (o.error) return book.done(), o
-  const { session, req } = o
   let closed = false
   const send = (msg) => {
-    if (!closed && !req.destroyed && req.writable) req.write(frame(msg))
+    if (!closed) o.send(msg)
   }
   const heartbeat = setInterval(() => send(pb().bytes(7, EMPTY).done()), 5000) // the client is still there, as the CLI says
   const close = () => {
     if (closed) return
     closed = true
     clearInterval(heartbeat)
-    try {
-      req.close(http2.constants.NGHTTP2_CANCEL)
-    } catch {}
-    session.close()
-    setTimeout(() => session.destroy(), 1000).unref?.()
+    o.close()
   }
   signal?.addEventListener("abort", close, { once: true })
-  send(first)
+  // On HTTP/1.1 the Run is a BidiAppend, sent before RunSSE's headers:
+  // the server reads it to decide what that stream answers. On HTTP/2 it
+  // is the first frame, written once the headers are in.
+  if (http11) send(first)
+  try {
+    await o.ready
+  } catch (e) {
+    close()
+    book.done()
+    return { error: o.failed ?? { status: 502, message: e?.message ?? String(e) } }
+  }
+  if (!http11) send(first)
+  if (o.failed) {
+    close()
+    book.done()
+    return { error: o.failed }
+  }
   if (o.status < 200 || o.status > 299) {
     const chunks = []
     try {
-      for await (const c of req) chunks.push(c)
+      for await (const c of o.body ?? []) chunks.push(Buffer.from(c))
     } catch {}
     close()
     book.done()
     return { error: failure(o.status, Buffer.concat(chunks).toString("utf8").slice(0, 1 << 20)) }
   }
-  const it = decode(frames(req), {
+  const it = decode(frames(o.body), {
     send,
     blobs,
     tools,
@@ -1802,7 +1928,7 @@ function kept(res) {
 }
 
 // answer runs a chat completion on Cursor, the account kept (errorResponse).
-const answer = async (auth, chat, signal, session) => kept(await answerOf(auth, chat, signal, session))
+const answer = async (auth, chat, signal, session, http11 = false) => kept(await answerOf(auth, chat, signal, session, http11))
 
 // maxOnly are the ids Cursor said it serves in Max Mode only.
 const maxOnly = new Set()
@@ -1814,7 +1940,7 @@ const maxRequired = (msg) => /max[ _]mode[ _]required|requires max mode/i.test(S
 
 // answerOf runs a chat completion on Cursor and answers it as one, streamed
 // or not.
-async function answerOf(auth, chat, signal, session = "") {
+async function answerOf(auth, chat, signal, session = "", http11 = false) {
   let tok
   try {
     tok = await tokenOf(auth)
@@ -1837,7 +1963,7 @@ async function answerOf(auth, chat, signal, session = "") {
   const conv = conversation(chat, tools)
   const convID = conversationID(chat, session)
   let base = await agentURL(tok, false)
-  const once = () => runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, params })
+  const once = () => runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, params, http11 })
   let r = await once()
   if (r.error && regional(r.error.message)) {
     // the team moved, or the config was kept from before: once more with
@@ -1913,7 +2039,11 @@ async function answerOf(auth, chat, signal, session = "") {
 
 // ---- the plugin ---------------------------------------------------------------------------
 
-export async function CursorAuthPlugin() {
+export async function CursorAuthPlugin(_input, options) {
+  // http11 follows the plugin's own options, else CURSOR_HTTP. The config
+  // hook below also takes provider.cursor.options.http, which is where
+  // OpenCode keeps it.
+  let http11 = useHTTP11(options?.http ?? process.env.CURSOR_HTTP)
   return {
     auth: {
       provider: ID,
@@ -1937,7 +2067,7 @@ export async function CursorAuthPlugin() {
               return errorResponse({ status: 400, message: "a request that isn't JSON" })
             }
             const session = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined)).get(SESSION) ?? ""
-            return answer((await getAuth()) ?? auth, chat, init.signal ?? (input instanceof Request ? input.signal : undefined), session)
+            return answer((await getAuth()) ?? auth, chat, init.signal ?? (input instanceof Request ? input.signal : undefined), session, http11)
           },
         }
       },
@@ -1972,6 +2102,7 @@ export async function CursorAuthPlugin() {
     async config(config) {
       config.provider ??= {}
       const was = config.provider[ID] ?? {}
+      if (was.options?.http !== undefined) http11 = useHTTP11(was.options.http)
       config.provider[ID] = {
         name: "Cursor",
         npm: CHAT,

@@ -38,6 +38,13 @@ plugin's `fetch` answers them on Cursor's agent API:
 - Each request is one `agent.v1.AgentService/Run`, a Connect stream both
   ways over HTTP/2, with the CLI's headers (`x-cursor-client-type: cli`,
   its version, privacy mode on).
+- HTTP/1.1 is Cursor's Network setting "HTTP Compatibility Mode". Give the
+  plugin `{ "http": "1.1" }` (`magpie plugin options` of this package, or
+  `provider.cursor.options.http` in OpenCode), or set `CURSOR_HTTP=1.1`.
+  A Run then goes as `AgentService/RunSSE` (the server's stream, carrying
+  only a request id) and one `BidiService/BidiAppend` per message the
+  client sends. Both are ordinary HTTP/1.1, which a proxy that breaks
+  HTTP/2 can carry. HTTP/2 stays the default.
 - The whole conversation goes each time, as AI SDK messages kept as blobs
   the server asks for. The caller's tools are MCP tools, listed in the
   system prompt; the model calls them through Cursor's `CallDynamicTool`,
