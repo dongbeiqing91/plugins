@@ -9,7 +9,7 @@ import http from "node:http"
 import http2 from "node:http2"
 import { CursorAuthPlugin, _internal } from "./index.mjs"
 
-const { fields, pb, frame } = _internal
+const { fields, pb, frame, http11Root } = _internal
 const field = (fs, num) => fs.find((f) => f.num === num)
 const pbStr = (fs, num) => field(fs, num)?.data.toString("utf8") ?? ""
 const pbNum = (fs, num) => field(fs, num)?.n ?? 0
@@ -75,8 +75,9 @@ beforeAll(async () => {
     }
     const len = body.readUInt32BE(1)
     const id = pbStr(fields(body.subarray(5, 5 + len)), 1)
-    const run = await waitAppend((a) => a.id === id && a.seq === 0)
+    // headers first, as Cursor's RunSSE does: the Run arrives on BidiAppend
     res.writeHead(200, { "content-type": "application/connect+proto" })
+    const run = await waitAppend((a) => a.id === id && a.seq === 0)
     // a blob the client does not have: it still has to append the miss
     // before this stream says anything of the answer
     res.write(frame(pb().bytes(4, pb().varint(1, 7).bytes(2, pb().bytes(1, Buffer.from("ab", "hex")))).done()))
@@ -120,6 +121,12 @@ async function ask(auth, how) {
   expect([res.status, j.error]).toEqual([200, undefined])
   expect(j.choices[0].message.content).toBe("hi")
 }
+
+test("a Cursor agent host is rewritten to api2; a stand-in is kept", () => {
+  expect(http11Root("https://agentn.us.api5.cursor.sh")).toBe("https://api2.cursor.sh")
+  expect(http11Root("https://agentn.global.api5.cursor.sh/")).toBe("https://api2.cursor.sh")
+  expect(http11Root(base)).toBe(base)
+})
 
 test("HTTP/1.1 mode is RunSSE plus BidiAppend, and the stream waits on those appends", async () => {
   fakeAPI()

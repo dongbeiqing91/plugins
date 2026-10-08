@@ -1546,18 +1546,29 @@ function post11(url, headers, body, signal) {
   })
 }
 
+// http11Root is where an HTTP/1.1 Run goes. Cursor's agent host
+// (agentn.*.api5.cursor.sh) accepts AgentService/Run only over HTTP/2 and
+// resets an HTTP/1.1 RunSSE or BidiAppend. The compatibility mode, as
+// Cursor's own client does with HTTP/2 disabled, talks to api2.cursor.sh.
+// A non-Cursor base (a test's stand-in) is kept.
+function http11Root(base) {
+  const u = new URL(base)
+  if (/(^|\.)cursor\.sh$/i.test(u.hostname)) return API
+  return u.origin + u.pathname.replace(/\/+$/, "")
+}
+
 // openHTTP11 is Cursor's HTTP/1.1 mode. RunSSE is a server stream whose
 // only input is the request id. Everything the client would have written
 // on the HTTP/2 stream is a BidiAppend of that id, numbered from 0: the
-// raw protobuf, not a Connect frame. The two start together, because the
-// server reads the appends to know what to stream.
+// raw protobuf, not a Connect frame.
 function openHTTP11(base, headers, signal) {
   const requestId = randomUUID()
-  const u = new URL(base)
-  const root = u.origin + u.pathname.replace(/\/+$/, "")
-  const ac = new AbortController()
-  const onAbort = () => ac.abort()
-  if (signal?.aborted) ac.abort()
+  const root = http11Root(base)
+  const sseAbort = new AbortController()
+  const onAbort = () => {
+    sseAbort.abort()
+  }
+  if (signal?.aborted) onAbort()
   else signal?.addEventListener("abort", onAbort, { once: true })
   let seq = 0
   let closed = false
@@ -1566,38 +1577,38 @@ function openHTTP11(base, headers, signal) {
     body: null,
     failed: null,
     send(msg) {
-      if (closed || ac.signal.aborted) return
+      if (closed || sseAbort.signal.aborted) return
       const n = seq++
       // BidiAppendRequest: request_id (2), append_seqno (3), data_binary (4)
       const body = pb().bytes(2, pb().str(1, requestId)).varint(3, n).bytes(4, msg).done()
-      post11(root + "/aiserver.v1.BidiService/BidiAppend", cursorHeaders(headers, "application/proto"), body, ac.signal)
+      post11(root + "/aiserver.v1.BidiService/BidiAppend", cursorHeaders(headers, "application/proto"), body, signal)
         .then(async (res) => {
           if (res.ok || closed) {
             await res.body?.cancel?.()
             return
           }
           out.failed = failure(res.status, await res.text())
-          ac.abort()
         })
         .catch((e) => {
-          if (closed || ac.signal.aborted) return
+          if (closed || sseAbort.signal.aborted) return
           out.failed = { status: 502, message: e?.message ?? String(e) }
-          ac.abort()
         })
     },
     close() {
       if (closed) return
       closed = true
       signal?.removeEventListener("abort", onAbort)
-      ac.abort()
+      sseAbort.abort()
     },
     ready: null,
   }
+  // Cursor opens RunSSE with the request id first, then BidiAppends the Run
+  // (and heartbeats, blobs, tool results) on aiserver.v1.BidiService.
   out.ready = post11(
     root + "/agent.v1.AgentService/RunSSE",
     cursorHeaders(headers, "application/connect+proto"),
     frame(pb().str(1, requestId).done()),
-    ac.signal,
+    sseAbort.signal,
   )
     .then((res) => {
       out.status = res.status
@@ -1651,12 +1662,12 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
     o.close()
   }
   signal?.addEventListener("abort", close, { once: true })
-  // On HTTP/1.1 the Run is a BidiAppend, sent before RunSSE's headers:
-  // the server reads it to decide what that stream answers. On HTTP/2 it
-  // is the first frame, written once the headers are in.
+  const opening = o.ready
+  // HTTP/1.1: RunSSE is in flight; the Run goes on BidiAppend while the
+  // response stream opens. HTTP/2: the stream's headers first, then a frame.
   if (http11) send(first)
   try {
-    await o.ready
+    await opening
   } catch (e) {
     close()
     book.done()
@@ -2130,4 +2141,4 @@ export async function CursorAuthPlugin(_input, options) {
 }
 
 // for tests
-export const _internal = { STEP_WAIT, stepUsage, ledger, owed, flights, misses, unreadable, catalog, usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { STEP_WAIT, stepUsage, ledger, owed, flights, misses, unreadable, catalog, usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry, http11Root }

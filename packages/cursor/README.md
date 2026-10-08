@@ -43,7 +43,8 @@ plugin's `fetch` answers them on Cursor's agent API:
   `provider.cursor.options.http` in OpenCode), or set `CURSOR_HTTP=1.1`.
   A Run then goes as `AgentService/RunSSE` (the server's stream, carrying
   only a request id) and one `BidiService/BidiAppend` per message the
-  client sends. Both are ordinary HTTP/1.1, which a proxy that breaks
+  client sends, both to `api2.cursor.sh`. The agent host named for HTTP/2
+  resets these. Both are ordinary HTTP/1.1, which a proxy that breaks
   HTTP/2 can carry. HTTP/2 stays the default.
 - The whole conversation goes each time, as AI SDK messages kept as blobs
   the server asks for. The caller's tools are MCP tools, listed in the
